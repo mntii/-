@@ -1,369 +1,209 @@
 """
-Telegram Bot — Multi-Agent Intelligence System
-===============================================
-Commands:
-  /start          — Welcome message
-  /analyze <topic> — Run full 5-expert analysis
-  /fitness        — Show agent fitness table
-  /help           — Help message
-
-Usage:
-    python telegram_bot.py
+Telegram bot interface for the Multi-Agent World.
+Shows live agent conversations, health, and world state.
 """
 
 import asyncio
-import sys
-import textwrap
-import threading
+import html
+import logging
 from typing import Optional
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
+from telegram import Update
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 import config
-from core.memory import AgentMemory
-from core.evolution import EvolutionEngine
-from agents.historical_analyst import HistoricalAnalyst
-from agents.behavioral_analyst import BehavioralAnalyst
-from agents.strategic_forecaster import StrategicForecaster
-from agents.devils_advocate import DevilsAdvocate
-from agents.coordinator import Coordinator
+from agents.autonomous_agent import AutonomousAgent
+from core.conversation import ConversationSession, Turn
+from core.memory import WorldDB
+from core.peer_eval import run_peer_evaluations
 
-# ── Shared memory (all users share the same agent pool) ───────────────
-memory = AgentMemory()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-# Lock so only one analysis runs at a time (avoids SQLite conflicts)
-_analysis_lock = threading.Lock()
-
-# Track ongoing sessions: user_id → session_id (for rating callback)
-_pending_ratings: dict[int, str] = {}
-
-# ── Agent labels for progress messages ────────────────────────────────
-AGENT_STEPS = [
-    ("📜", "Historical Analyst",   "analyzing historical patterns..."),
-    ("🧠", "Behavioral Analyst",   "decoding crowd psychology..."),
-    ("🌍", "Strategic Forecaster", "mapping macro scenarios..."),
-    ("😈", "Devil's Advocate",     "stress-testing all arguments..."),
-]
-
-RATING_BUTTONS = [
-    [
-        InlineKeyboardButton("💀 0",   callback_data="rate_0"),
-        InlineKeyboardButton("😞 25",  callback_data="rate_25"),
-        InlineKeyboardButton("😐 50",  callback_data="rate_50"),
-    ],
-    [
-        InlineKeyboardButton("👍 75",  callback_data="rate_75"),
-        InlineKeyboardButton("🔥 90",  callback_data="rate_90"),
-        InlineKeyboardButton("🏆 100", callback_data="rate_100"),
-    ],
-]
-
-MAX_TG_LEN = 4000  # Telegram message character limit (safe margin)
+DEFAULT_NAMES = ["Ara", "Kael", "Sova", "Nyx", "Zhen"]
+MAX_MSG = 4000
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────
-
-def _split_message(text: str, limit: int = MAX_TG_LEN) -> list[str]:
-    """Split a long text into Telegram-safe chunks."""
-    if len(text) <= limit:
-        return [text]
-    parts: list[str] = []
-    while text:
-        parts.append(text[:limit])
-        text = text[limit:]
-    return parts
+def _chunk(text: str, size: int = MAX_MSG) -> list[str]:
+    return [text[i:i+size] for i in range(0, len(text), size)]
 
 
-def _build_agents():
-    experts = [
-        HistoricalAnalyst(memory),
-        BehavioralAnalyst(memory),
-        StrategicForecaster(memory),
-        DevilsAdvocate(memory),
-    ]
-    coordinator = Coordinator(memory)
-    return experts, coordinator
+def _health_bar(h: float) -> str:
+    filled = int(h / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    emoji = "🟢" if h > 60 else ("🟡" if h > 30 else "🔴")
+    return f"{emoji} {bar} {h:.0f}/100"
 
 
-def _fitness_text() -> str:
-    experts, _ = _build_agents()
-    lines = ["*🧬 Agent Fitness Scores*\n"]
-    for agent in experts:
-        stored = memory.get_agent(agent.agent_id)
-        fitness = stored["fitness"] if stored else 0.5
-        gen = stored["generation"] if stored else 0
-        bar_filled = int(fitness * 10)
-        bar = "█" * bar_filled + "░" * (10 - bar_filled)
-        status = "✅" if fitness >= config.MIN_FITNESS_THRESHOLD else "⚠️"
+def _ensure_agents(db: WorldDB) -> list[AutonomousAgent]:
+    alive = db.all_alive()
+    if not alive:
+        agents = []
+        for name in DEFAULT_NAMES:
+            a = AutonomousAgent.create_new(name, db)
+            agents.append(a)
+        return agents
+    return [a for row in alive if (a := AutonomousAgent.load(row["id"], db))]
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db: WorldDB = ctx.bot_data["db"]
+    agents = _ensure_agents(db)
+    lines = ["<b>🌍 Multi-Agent World</b>\n"]
+    for a in agents:
+        row = db.get_agent(a.id)
+        h = row["health"] if row else 0
+        lines.append(f"• <b>{html.escape(a.name)}</b> — {_health_bar(h)}")
+    lines.append("\n<i>Commands:</i>")
+    lines.append("/talk [topic] — run a conversation session")
+    lines.append("/agents — agent status table")
+    lines.append("/reset — restart the world with fresh agents")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db: WorldDB = ctx.bot_data["db"]
+    rows = db.all_alive()
+    if not rows:
+        await update.message.reply_text("🌑 The world is empty. Use /start to begin.")
+        return
+
+    lines = ["<b>Agent Status</b>\n"]
+    for row in rows:
+        skills = db.get_skills(row["id"])
+        top = ", ".join(f"{k}({v:.2f})" for k, v in list(skills.items())[:3]) or "none"
         lines.append(
-            f"{status} `{agent.ROLE}`\n"
-            f"   Gen {gen} | Fitness `{fitness:.2f}` `{bar}`\n"
+            f"<b>{html.escape(row['name'])}</b> (gen {row['generation']})\n"
+            f"  {_health_bar(row['health'])}\n"
+            f"  Age: {row['age']} | Skills: {html.escape(top)}\n"
         )
-    return "\n".join(lines)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-def _run_analysis_sync(topic: str) -> tuple[str, str, list]:
-    """Blocking analysis — runs in a thread executor."""
-    experts, coordinator = _build_agents()
-
-    import uuid
-    session_id = uuid.uuid4().hex
-    for agent in [*experts, coordinator]:
-        agent.memory.create_session(session_id, topic)
-
-    all_rounds: list[dict[str, str]] = []
-
-    # Round 1 — independent
-    round_1: dict[str, str] = {}
-    for expert in experts:
-        analysis = expert.analyze(topic, session_id, round_num=1)
-        round_1[expert.ROLE] = analysis
-    all_rounds.append(round_1)
-
-    # Debate rounds
-    for round_num in range(2, config.DIALOGUE_ROUNDS + 2):
-        current: dict[str, str] = {}
-        for expert in experts:
-            peers = {
-                role: content
-                for role, content in all_rounds[-1].items()
-                if role != expert.ROLE
-            }
-            response = expert.respond_to_peers(topic, peers, session_id, round_num)
-            current[expert.ROLE] = response
-        all_rounds.append(current)
-
-    # Final synthesis
-    final_report = coordinator.synthesize(topic, all_rounds, session_id)
-    coordinator.extract_learnings(
-        topic, all_rounds, {e.ROLE: e for e in experts}
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db: WorldDB = ctx.bot_data["db"]
+    with db._cx() as c:
+        c.execute("UPDATE agents SET alive=0")
+    agents = _ensure_agents(db)
+    names = ", ".join(a.name for a in agents)
+    await update.message.reply_text(
+        f"🌱 <b>World reset.</b> New agents: {html.escape(names)}",
+        parse_mode=ParseMode.HTML,
     )
-    return session_id, final_report, all_rounds
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Command handlers
-# ─────────────────────────────────────────────────────────────────────
+async def cmd_talk(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db: WorldDB = ctx.bot_data["db"]
+    topic = " ".join(ctx.args) if ctx.args else ""
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "🧠 *Multi\\-Agent Intelligence System*\n\n"
-        "5 AI experts debate your topic, challenge each other, "
-        "and produce a final intelligence report\\.\n\n"
-        "📜 Historical Analyst\n"
-        "🧠 Behavioral Analyst\n"
-        "🌍 Strategic Forecaster\n"
-        "😈 Devil's Advocate\n"
-        "⚖️ Coordinator \\(final report\\)\n\n"
-        "Agents *learn and evolve* from your feedback\\.\n\n"
-        "▶️ Send any topic or use:\n"
-        "`/analyze Saudi Aramco 2025`"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "*Commands:*\n\n"
-        "`/analyze <topic>` — Run full analysis\n"
-        "`/fitness` — Show agent fitness scores\n"
-        "`/start` — Welcome message\n\n"
-        "*Or just send any text message* to analyze it directly\\."
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-async def cmd_fitness(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(_fitness_text(), parse_mode=ParseMode.MARKDOWN_V2)
-
-
-async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    topic = " ".join(context.args).strip() if context.args else ""
-    if not topic:
-        await update.message.reply_text(
-            "Please provide a topic:\n`/analyze Saudi Aramco outlook 2025`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        return
-    await _run_topic(update, context, topic)
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Any plain message is treated as a topic to analyze."""
-    topic = update.message.text.strip()
-    if topic:
-        await _run_topic(update, context, topic)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Core analysis flow
-# ─────────────────────────────────────────────────────────────────────
-
-async def _run_topic(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str
-) -> None:
-    user_id = update.effective_user.id
-
-    if not _analysis_lock.acquire(blocking=False):
-        await update.message.reply_text(
-            "⏳ An analysis is already running. Please wait a moment and try again."
-        )
+    agents = _ensure_agents(db)
+    if not agents:
+        await update.message.reply_text("🌑 No agents alive. Use /reset.")
         return
 
-    try:
-        # Progress message that we edit as each step completes
-        progress_msg = await update.message.reply_text(
-            f"🔍 *Analyzing:* `{topic}`\n\n"
-            "⏳ Starting expert panel...",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+    header = f"💬 <b>Session starting</b> {'— Topic: ' + html.escape(topic) if topic else ''}\n"
+    header += f"Agents: {', '.join(html.escape(a.name) for a in agents)}\n"
+    header += "─" * 30
+    await update.message.reply_text(header, parse_mode=ParseMode.HTML)
 
-        async def update_progress(step: int, done: bool = False) -> None:
-            lines = [f"🔍 *Analyzing:* `{topic}`\n"]
-            for i, (icon, name, action) in enumerate(AGENT_STEPS):
-                if i < step:
-                    lines.append(f"✅ {icon} {name}")
-                elif i == step and not done:
-                    lines.append(f"⚙️ {icon} {name} — _{action}_")
-                else:
-                    lines.append(f"⬜ {icon} {name}")
-            if done:
-                lines.append("\n⚖️ Coordinator synthesizing final report...")
-            try:
-                await progress_msg.edit_text(
-                    "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2
-                )
-            except Exception:
-                pass
+    buffer: list[str] = []
+    msg_obj = None
 
-        # Run blocking analysis in thread (keeps event loop free)
-        loop = asyncio.get_event_loop()
+    async def flush_buffer():
+        nonlocal msg_obj, buffer
+        if not buffer:
+            return
+        text = "\n".join(buffer)
+        for chunk in _chunk(text):
+            msg_obj = await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        buffer = []
 
-        # Update progress before each expert (approximate — actual call is sync)
-        for step_idx in range(len(AGENT_STEPS)):
-            await update_progress(step_idx)
-            await asyncio.sleep(0.1)
+    AGENT_COLORS = {}
+    color_pool = ["cyan", "magenta", "blue", "green", "yellow"]
+    color_idx = 0
 
-        session_id, final_report, all_rounds = await loop.run_in_executor(
-            None, _run_analysis_sync, topic
-        )
+    def on_turn(turn: Turn) -> None:
+        nonlocal color_idx
+        if turn.speaker_id == "world":
+            buffer.append(f"<i>{html.escape(turn.content)}</i>")
+            return
+        if turn.speaker_id not in AGENT_COLORS:
+            AGENT_COLORS[turn.speaker_id] = color_pool[color_idx % len(color_pool)]
+            color_idx += 1
+        buffer.append(f"<b>{html.escape(turn.speaker_name)}:</b> {html.escape(turn.content)}")
 
-        await update_progress(len(AGENT_STEPS), done=True)
-        _pending_ratings[user_id] = session_id
+    # Run conversation in thread pool (Claude calls are blocking)
+    loop = asyncio.get_event_loop()
+    session = ConversationSession(agents, db, topic=topic, max_turns=10, on_turn=on_turn)
 
-        # Delete progress message
-        try:
-            await progress_msg.delete()
-        except Exception:
-            pass
+    history = await loop.run_in_executor(None, session.run)
 
-        # Send header
-        await update.message.reply_text(
-            f"⚖️ *INTELLIGENCE REPORT*\n📌 Topic: `{topic}`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+    await flush_buffer()
 
-        # Send final report (split if too long)
-        for chunk in _split_message(final_report):
-            await update.message.reply_text(chunk)
+    # Learning phase
+    await update.message.reply_text("📚 <b>Learning phase...</b>", parse_mode=ParseMode.HTML)
+    health_map = await loop.run_in_executor(None, session.apply_all_learning)
 
-        # Rating buttons
-        await update.message.reply_text(
-            "📊 *Rate this analysis* to help agents evolve:",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup(RATING_BUTTONS),
-        )
+    health_lines = ["<b>Health after learning:</b>"]
+    for name, h in health_map.items():
+        if h <= 0:
+            health_lines.append(f"• {html.escape(name)}: 💀 <b>DIED</b>")
+        else:
+            health_lines.append(f"• {html.escape(name)}: {_health_bar(h)}")
+    await update.message.reply_text("\n".join(health_lines), parse_mode=ParseMode.HTML)
 
-    except Exception as exc:
-        await update.message.reply_text(
-            f"❌ Analysis failed: `{str(exc)[:200]}`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-    finally:
-        _analysis_lock.release()
+    # Peer evaluation
+    alive_agents = [a for a in agents if a.is_alive()]
+    agent_names = {a.id: a.name for a in agents}
+    history_dicts = [
+        {"speaker_id": t.speaker_id, "speaker_name": t.speaker_name, "content": t.content}
+        for t in history
+    ]
+    trust_map = await loop.run_in_executor(
+        None,
+        lambda: run_peer_evaluations(history_dicts, [a.id for a in alive_agents], agent_names, db)
+    )
 
+    trust_lines = ["<b>Peer trust updates:</b>"]
+    for aid, delta in trust_map.items():
+        name = agent_names.get(aid, aid)
+        sign = "+" if delta >= 0 else ""
+        trust_lines.append(f"• {html.escape(name)}: {sign}{delta:.3f}")
+    await update.message.reply_text("\n".join(trust_lines), parse_mode=ParseMode.HTML)
 
-# ─────────────────────────────────────────────────────────────────────
-# Rating callback
-# ─────────────────────────────────────────────────────────────────────
+    # Reproduction
+    children = await loop.run_in_executor(None, session.check_reproduction)
+    if children:
+        born_names = ", ".join(html.escape(c.name) for c in children)
+        await update.message.reply_text(f"🌱 <b>New agents born:</b> {born_names}", parse_mode=ParseMode.HTML)
 
-async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    data = query.data  # e.g. "rate_75"
-
-    if not data.startswith("rate_"):
-        return
-
-    rating = float(data.split("_")[1])
-    session_id = _pending_ratings.pop(user_id, None)
-
-    if session_id:
-        # Apply feedback and evolve
-        experts, _ = _build_agents()
-        evolution = EvolutionEngine(experts)
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, evolution.apply_feedback, session_id, rating
-        )
-
-        await query.edit_message_text(
-            f"✅ Feedback saved: *{int(rating)}/100*\n\n"
-            f"Agents will evolve based on your rating\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-
-        # Send updated fitness table
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=_fitness_text(),
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-    else:
-        await query.edit_message_text("⚠️ Session not found. Rating not applied.")
+    # Final status
+    await cmd_agents(update, ctx)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.strip()
+    if text:
+        ctx.args = text.split()
+        await cmd_talk(update, ctx)
+
 
 def main() -> None:
     if not config.TELEGRAM_BOT_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN is not set in .env")
-        sys.exit(1)
+        raise EnvironmentError("TELEGRAM_BOT_TOKEN missing in .env")
 
-    app = (
-        Application.builder()
-        .token(config.TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    db = WorldDB()
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app.bot_data["db"] = db
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("fitness", cmd_fitness))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CallbackQueryHandler(handle_rating, pattern=r"^rate_"))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("agents", cmd_agents))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("talk", cmd_talk))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("🤖 Telegram bot started. Press Ctrl+C to stop.")
+    log.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
 
 

@@ -1,131 +1,148 @@
 """
-Multi-Agent Intelligence System
-================================
-5 specialized AI experts debate, challenge each other, learn from humans,
-evolve their prompts, and reproduce high-performing variants.
-
-Usage:
-    python main.py
-    python main.py --topic "Saudi Aramco stock outlook 2025"
-    python main.py --fitness   # Show current fitness table
+Multi-Agent World — CLI entry point.
+Agents start as strangers, learn to survive, teach each other, reproduce.
 """
 
 import argparse
 import sys
+import time
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt, FloatPrompt, Confirm
+from rich.table import Table
 
-from config import ANTHROPIC_API_KEY
-from core.memory import AgentMemory
-from core.dialogue import DialogueOrchestrator
-from core.evolution import EvolutionEngine
-from agents.historical_analyst import HistoricalAnalyst
-from agents.behavioral_analyst import BehavioralAnalyst
-from agents.strategic_forecaster import StrategicForecaster
-from agents.devils_advocate import DevilsAdvocate
-from agents.coordinator import Coordinator
+import config
+from agents.autonomous_agent import AutonomousAgent
+from core.conversation import ConversationSession
+from core.memory import WorldDB
+from core.peer_eval import run_peer_evaluations
 
 console = Console()
 
-BANNER = """
-╔══════════════════════════════════════════════════════════════╗
-║        🧠  MULTI-AGENT INTELLIGENCE SYSTEM  🧠               ║
-║                                                              ║
-║  Expert 1 • Historical Analyst   📜                          ║
-║  Expert 2 • Behavioral Analyst   🧠                          ║
-║  Expert 3 • Strategic Forecaster 🌍                          ║
-║  Expert 4 • Devil's Advocate     😈                          ║
-║  Expert 5 • Coordinator          ⚖️                           ║
-║                                                              ║
-║  Agents learn, evolve, and reproduce with every session.     ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+DEFAULT_NAMES = ["Ara", "Kael", "Sova", "Nyx", "Zhen"]
 
 
-def build_agents(memory: AgentMemory) -> tuple[list, Coordinator]:
-    experts = [
-        HistoricalAnalyst(memory),
-        BehavioralAnalyst(memory),
-        StrategicForecaster(memory),
-        DevilsAdvocate(memory),
-    ]
-    coordinator = Coordinator(memory)
-    return experts, coordinator
-
-
-def run_analysis(topic: str, memory: AgentMemory) -> None:
-    experts, coordinator = build_agents(memory)
-    evolution = EvolutionEngine(experts)
-    orchestrator = DialogueOrchestrator(experts, coordinator)
-
-    console.print(
-        Panel(
-            f"[bold white]TOPIC:[/bold white] [yellow]{topic}[/yellow]",
-            title="🔍 Analysis Target",
-            border_style="blue",
+def _status_table(db: WorldDB) -> Table:
+    agents = db.all_alive()
+    t = Table(title="Agent World", show_lines=True)
+    t.add_column("Name", style="cyan")
+    t.add_column("Health", justify="right")
+    t.add_column("Age", justify="right")
+    t.add_column("Gen", justify="right")
+    t.add_column("Top Skills")
+    for row in agents:
+        skills = db.get_skills(row["id"])
+        top = ", ".join(f"{k}({v:.2f})" for k, v in list(skills.items())[:3]) or "—"
+        h = row["health"]
+        color = "green" if h > 60 else ("yellow" if h > 30 else "red")
+        t.add_row(
+            row["name"],
+            f"[{color}]{h:.1f}[/{color}]",
+            str(row["age"]),
+            str(row["generation"]),
+            top,
         )
-    )
+    return t
 
-    session_id, final_report, all_rounds = orchestrator.run(topic)
 
-    # ── Human feedback loop ────────────────────────────────────────────
-    console.rule("[bold blue]📊 Human Feedback & Evolution[/bold blue]")
-    console.print(
-        "\n[cyan]Your feedback trains the agents to improve over time.[/cyan]\n"
-    )
-
-    if Confirm.ask("Rate this analysis? (helps agents evolve)", default=True):
-        rating = FloatPrompt.ask(
-            "Rate the analysis accuracy (0 = terrible, 100 = perfect)",
-            default=70.0,
-        )
-        rating = max(0.0, min(100.0, rating))
-
-        evolution.apply_feedback(session_id, rating)
-        memory.save_user_rating(session_id, rating)
-
-        console.print(f"\n[green]✅ Feedback saved. Rating: {rating:.0f}/100[/green]")
-        console.print("[green]Agents will evolve based on this session.[/green]\n")
+def _ensure_world(db: WorldDB) -> list[AutonomousAgent]:
+    alive = db.all_alive()
+    agents = []
+    if not alive:
+        console.print("[yellow]No agents found — creating founding generation...[/yellow]")
+        for name in DEFAULT_NAMES:
+            a = AutonomousAgent.create_new(name, db)
+            agents.append(a)
+            console.print(f"  Born: [cyan]{name}[/cyan] ({a.id})")
     else:
-        console.print("[dim]Skipping feedback. Agents will not evolve this session.[/dim]\n")
+        for row in alive:
+            a = AutonomousAgent.load(row["id"], db)
+            if a:
+                agents.append(a)
+    return agents
 
 
-def show_fitness(memory: AgentMemory) -> None:
-    experts, _ = build_agents(memory)
-    evolution = EvolutionEngine(experts)
-    evolution.display_fitness_table()
+def run_session(db: WorldDB, topic: str = "", turns: int = 12) -> None:
+    agents = _ensure_world(db)
+    if not agents:
+        console.print("[red]All agents are dead. World is empty.[/red]")
+        return
+
+    console.print(Panel(f"[bold]Session starting[/bold] | Topic: {topic or '(open)'} | Agents: {len(agents)} | Turns: {turns}"))
+
+    def on_turn(turn):
+        if turn.speaker_id == "world":
+            console.print(f"\n[dim italic]{turn.content}[/dim italic]")
+        else:
+            color = "cyan" if turn.speaker_id == agents[0].id else "magenta"
+            console.print(f"\n[bold {color}]{turn.speaker_name}:[/bold {color}] {turn.content}")
+
+    session = ConversationSession(agents, db, topic=topic, max_turns=turns, on_turn=on_turn)
+    history = session.run()
+
+    console.print("\n[bold]─── Learning Phase ───[/bold]")
+    health_map = session.apply_all_learning()
+    for name, h in health_map.items():
+        status = "[red]DIED[/red]" if h <= 0 else f"[green]{h:.1f}[/green]"
+        console.print(f"  {name}: health → {status}")
+
+    console.print("\n[bold]─── Peer Evaluations ───[/bold]")
+    alive_agents = [a for a in agents if a.is_alive()]
+    agent_names = {a.id: a.name for a in agents}
+    history_dicts = [
+        {"speaker_id": t.speaker_id, "speaker_name": t.speaker_name, "content": t.content}
+        for t in history
+    ]
+    trust_map = run_peer_evaluations(history_dicts, [a.id for a in alive_agents], agent_names, db)
+    for aid, delta in trust_map.items():
+        name = agent_names.get(aid, aid)
+        sign = "+" if delta >= 0 else ""
+        console.print(f"  {name}: trust received {sign}{delta:.3f}")
+
+    console.print("\n[bold]─── Reproduction ───[/bold]")
+    children = session.check_reproduction()
+    if children:
+        for child in children:
+            console.print(f"  [green]Born:[/green] {child.name} (child of {child._row().get('parent_id', '?')})")
+    else:
+        console.print("  No reproduction this session.")
+
+    console.print()
+    console.print(_status_table(db))
+
+
+def cmd_status(db: WorldDB) -> None:
+    console.print(_status_table(db))
+
+
+def cmd_kill_all(db: WorldDB) -> None:
+    with db._cx() as c:
+        c.execute("UPDATE agents SET alive=0")
+    console.print("[red]All agents killed. Run without --reset to start fresh.[/red]")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Multi-Agent Intelligence System")
-    parser.add_argument("--topic", type=str, help="Topic to analyze")
-    parser.add_argument("--fitness", action="store_true", help="Show agent fitness table")
+    parser = argparse.ArgumentParser(description="Multi-Agent World")
+    parser.add_argument("--topic", "-t", default="", help="Conversation topic")
+    parser.add_argument("--turns", "-n", type=int, default=12, help="Max conversation turns")
+    parser.add_argument("--status", action="store_true", help="Show agent status table")
+    parser.add_argument("--reset", action="store_true", help="Kill all agents and start fresh")
     args = parser.parse_args()
 
-    console.print(BANNER, style="bold cyan")
+    db = WorldDB()
 
-    memory = AgentMemory()
-
-    if args.fitness:
-        show_fitness(memory)
+    if args.status:
+        cmd_status(db)
         return
 
-    if args.topic:
-        topic = args.topic
-    else:
-        console.print(
-            "[cyan]Enter any topic you want analyzed:[/cyan]\n"
-            "[dim]Examples: 'Saudi Aramco stock 2025', 'Bitcoin next 6 months', "
-            "'Tesla valuation', 'Real estate Dubai'[/dim]\n"
-        )
-        topic = Prompt.ask("[bold yellow]Topic").strip()
-        if not topic:
-            console.print("[red]No topic provided. Exiting.[/red]")
-            sys.exit(1)
+    if args.reset:
+        cmd_kill_all(db)
+        db = WorldDB()
 
-    run_analysis(topic, memory)
+    try:
+        run_session(db, topic=args.topic, turns=args.turns)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Session interrupted.[/yellow]")
 
 
 if __name__ == "__main__":

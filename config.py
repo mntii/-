@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "claude-opus-4-7")
 DIALOGUE_ROUNDS: int = int(os.getenv("DIALOGUE_ROUNDS", 2))
 MIN_FITNESS_THRESHOLD: float = float(os.getenv("MIN_FITNESS_THRESHOLD", 0.4))

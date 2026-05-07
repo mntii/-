@@ -1,76 +1,41 @@
-# Instagram DM Media Bot
+# Multi-Agent Intelligence System
 
-An automated bot that monitors your Instagram DMs, detects Instagram media links (Reels, Posts, IGTV, Stories, Carousels), downloads them, and sends the files back to the sender.
+5 specialized AI experts that debate, challenge each other, evolve, and reproduce.
 
-## Features
+## Agents
 
-- **DM Monitoring** — checks inbox every 30 seconds (configurable)
-- **Multi-media support** — Reels, Posts, IGTV, Stories, Carousel albums
-- **Session Persistence** — saves session to JSON to avoid repeated logins
-- **Self-Healing** — automatic re-authentication on session expiry with exponential backoff
-- **Human Simulation** — randomised delays and typing indicators to reduce detection risk
-- **Logging** — color console output + rotating log files in `logs/`
-- **Auto-Cleanup** — deletes downloaded files older than 24 hours
-- **Health Monitoring** — periodic CPU/RAM/disk usage reporting
-- **Graceful Shutdown** — handles Ctrl+C cleanly without data loss
-- **Proxy Support** — optional HTTP/SOCKS proxy
+| # | Expert | Role |
+|---|--------|------|
+| 1 | 📜 Historical Analyst | Historical patterns & base rates |
+| 2 | 🧠 Behavioral Analyst | Crowd psychology & sentiment |
+| 3 | 🌍 Strategic Forecaster | Macro, geopolitical scenarios |
+| 4 | 😈 Devil's Advocate | Challenges ALL arguments |
+| 5 | ⚖️ Coordinator | Synthesizes → Final report |
 
 ## Setup
 
 ```bash
-# 1. Clone and enter the project
-git clone <repo-url>
-cd instagram-bot
-
-# 2. Create a virtual environment
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Configure credentials
 cp .env.example .env
-nano .env   # Fill in INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD
-
-# 5. Run the bot
-python bot.py
+# Add your ANTHROPIC_API_KEY
+pip install -r requirements.txt
+python main.py
 ```
 
-## Project Structure
+## Usage
 
-```
-├── bot.py              # Entry point & main loop
-├── config.py           # Settings loaded from .env
-├── session_manager.py  # Login, session save/restore, re-auth
-├── downloader.py       # Media download logic (photo/video/carousel)
-├── dm_handler.py       # DM polling and message processing
-├── utils.py            # Cleanup, health check, graceful shutdown
-├── logger_setup.py     # Color console + rotating file logging
-├── requirements.txt    # Python dependencies
-├── .env.example        # Template for environment variables
-├── downloads/          # Downloaded media files (auto-created)
-└── logs/               # Log files (auto-created)
+```bash
+python main.py                                      # Interactive mode
+python main.py --topic "Saudi Aramco 2025"         # Direct topic
+python main.py --fitness                            # Agent fitness table
 ```
 
-## Configuration
+## How Evolution Works
 
-| Variable | Default | Description |
-|---|---|---|
-| `INSTAGRAM_USERNAME` | — | Your Instagram username |
-| `INSTAGRAM_PASSWORD` | — | Your Instagram password |
-| `CHECK_INTERVAL` | `30` | Seconds between DM checks |
-| `MAX_RETRIES` | `3` | Max re-auth attempts on failure |
-| `DOWNLOAD_FOLDER` | `downloads` | Where media files are saved |
-| `SESSION_FILE` | `session.json` | Session persistence file |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `PROXY_URL` | *(empty)* | Optional proxy URL |
-| `MIN_ACTION_DELAY` | `2` | Min seconds between actions |
-| `MAX_ACTION_DELAY` | `6` | Max seconds between actions |
+After each analysis session:
+1. User rates accuracy (0–100)
+2. Each agent's fitness score updates via exponential moving average
+3. **Weak agents** (fitness < 0.4) → Claude rewrites their system prompt
+4. **Critical agents** (fitness < 0.3) → Full prompt regeneration
+5. **Strong agents** (fitness > 0.75) → Spawn child variants with mutations
 
-## Important Notes
-
-- **Use a secondary account** — avoid using your main personal account with automation tools.
-- **Keep delays realistic** — the default 2–6s delay range mimics human behavior.
-- **Do not share your `session.json`** — it contains your login session data.
-- **Two-Factor Authentication** — disable 2FA on the bot account or the bot will refuse to start.
+Over time, agents learn which analytical approaches work and carry that knowledge forward.
